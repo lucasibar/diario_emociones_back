@@ -1,0 +1,17 @@
+{
+  "name": "diario-emociones-back",
+  "version": "1.0.0",
+  "description": "Backend de Diario de Emociones Push Server",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "node-cron": "^3.0.3",
+    "web-push": "^3.6.7"
+  }
+}
