@@ -46,10 +46,14 @@ if (process.env.DATABASE_URL) {
         id SERIAL PRIMARY KEY,
         endpoint TEXT UNIQUE NOT NULL,
         keys JSONB NOT NULL,
+        reminder_hours JSONB DEFAULT '[10, 20]',
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
-    `).catch(err => {
-      console.error('❌ Error al intentar auto-crear la tabla subscriptions en base de datos:', err);
+    `).then(() => {
+      // Run quick migration in case column wasn't there
+      return dbPool.query(`ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS reminder_hours JSONB DEFAULT '[10, 20]'`);
+    }).catch(err => {
+      console.error('❌ Error al intentar auto-crear o migrar la tabla subscriptions:', err);
     });
   } catch (err) {
     console.error('❌ Fallo al inicializar la base de datos PostgreSQL:', err);
@@ -88,10 +92,13 @@ webpush.setVapidDetails(
 async function getSubscriptions() {
   if (dbPool) {
     try {
-      const res = await dbPool.query('SELECT endpoint, keys FROM subscriptions');
+      const res = await dbPool.query('SELECT endpoint, keys, reminder_hours FROM subscriptions');
       return res.rows.map(row => ({
         endpoint: row.endpoint,
-        keys: row.keys
+        keys: row.keys,
+        reminder_hours: Array.isArray(row.reminder_hours) 
+          ? row.reminder_hours 
+          : (typeof row.reminder_hours === 'string' ? JSON.parse(row.reminder_hours) : (row.reminder_hours || [10, 20]))
       }));
     } catch (err) {
       console.error('Error al leer suscripciones de PostgreSQL:', err);
@@ -100,7 +107,12 @@ async function getSubscriptions() {
   } else {
     if (!fs.existsSync(SUBS_FILE)) return [];
     try {
-      return JSON.parse(fs.readFileSync(SUBS_FILE, 'utf8'));
+      const raw = JSON.parse(fs.readFileSync(SUBS_FILE, 'utf8'));
+      return raw.map(sub => ({
+        endpoint: sub.endpoint,
+        keys: sub.keys,
+        reminder_hours: sub.reminder_hours || [10, 20]
+      }));
     } catch (err) {
       return [];
     }
@@ -108,11 +120,12 @@ async function getSubscriptions() {
 }
 
 async function addSubscription(sub) {
+  const hours = sub.reminder_hours || [10, 20];
   if (dbPool) {
     try {
       await dbPool.query(
-        'INSERT INTO subscriptions (endpoint, keys) VALUES ($1, $2) ON CONFLICT (endpoint) DO UPDATE SET keys = EXCLUDED.keys',
-        [sub.endpoint, JSON.stringify(sub.keys)]
+        'INSERT INTO subscriptions (endpoint, keys, reminder_hours) VALUES ($1, $2, $3) ON CONFLICT (endpoint) DO UPDATE SET keys = EXCLUDED.keys, reminder_hours = EXCLUDED.reminder_hours',
+        [sub.endpoint, JSON.stringify(sub.keys), JSON.stringify(hours)]
       );
       console.log('[DB] Suscripción insertada/actualizada en Postgres.');
     } catch (err) {
@@ -125,12 +138,21 @@ async function addSubscription(sub) {
         subs = JSON.parse(fs.readFileSync(SUBS_FILE, 'utf8'));
       } catch (e) {}
     }
-    const exists = subs.find(s => s.endpoint === sub.endpoint);
-    if (!exists) {
-      subs.push(sub);
-      fs.writeFileSync(SUBS_FILE, JSON.stringify(subs, null, 2));
+    const existsIndex = subs.findIndex(s => s.endpoint === sub.endpoint);
+    const newSubData = {
+      endpoint: sub.endpoint,
+      keys: sub.keys,
+      reminder_hours: hours
+    };
+
+    if (existsIndex === -1) {
+      subs.push(newSubData);
       console.log('[JSON] Nueva suscripción guardada localmente.');
+    } else {
+      subs[existsIndex] = newSubData;
+      console.log('[JSON] Suscripción actualizada localmente.');
     }
+    fs.writeFileSync(SUBS_FILE, JSON.stringify(subs, null, 2));
   }
 }
 
@@ -250,18 +272,47 @@ app.post('/api/trigger-push', async (req, res) => {
   }
 });
 
-// --- 6. Cron Job Scheduling (10:00 y 20:00) ---
-cron.schedule('0 10,20 * * *', async () => {
-  console.log('⏰ [Cron] Disparando notificación diaria programada (10:00 / 20:00)');
-  const payload = {
-    title: '¿Cómo te sentís ahora?',
-    body: 'Es hora de tu registro diario. ¿Nos contás cómo va tu día?'
-  };
-  await sendPushNotification(payload);
+// --- 6. Cron Job Scheduling (Hourly check of custom times) ---
+cron.schedule('0 * * * *', async () => {
+  const currentHour = new Date().getHours();
+  console.log(`⏰ [Cron] Verificando recordatorios para la hora actual local: ${currentHour}:00`);
+
+  try {
+    const subscriptions = await getSubscriptions();
+    const targetSubscriptions = subscriptions.filter(sub => {
+      const hours = sub.reminder_hours || [10, 20];
+      return hours.includes(currentHour);
+    });
+
+    if (targetSubscriptions.length === 0) return;
+
+    console.log(`[Cron] Enviando notificaciones push a ${targetSubscriptions.length} suscriptores...`);
+    const payload = {
+      title: '¿Cómo te sentís ahora?',
+      body: 'Es hora de tu registro diario. ¿Nos contás cómo va tu día?'
+    };
+
+    const pushPromises = targetSubscriptions.map((sub, index) => {
+      return webpush.sendNotification(sub, JSON.stringify(payload))
+        .catch(async err => {
+          if (err.statusCode === 410 || err.statusCode === 404) {
+            console.log(`[Push] Suscripción obsoleta detectada. Removiendo.`);
+            await removeSubscription(sub.endpoint);
+          } else {
+            console.error('[Push] Error al enviar notificación:', err.message);
+          }
+          return null;
+        });
+    });
+
+    await Promise.all(pushPromises);
+  } catch (err) {
+    console.error('Error en ejecución del Cron horaria:', err);
+  }
 });
 
 // Start Server
 app.listen(PORT, () => {
   console.log(`🚀 API de Mood Tracker corriendo en http://localhost:${PORT}`);
-  console.log(`⏰ Cron programado para notificaciones: 10:00 y 20:00 (hora local)`);
+  console.log(`⏰ Cron programado para verificar recordatorios personalizados cada hora (00 minutos).`);
 });
