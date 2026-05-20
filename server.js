@@ -5,6 +5,9 @@ import cron from 'node-cron';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import pkg from 'pg';
+
+const { Pool } = pkg;
 
 // Resolve directory paths in ES Modules
 const __filename = fileURLToPath(import.meta.url);
@@ -13,33 +16,66 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Enable CORS for frontend clients (including localhost dev and production)
+// Enable CORS for frontend clients
 app.use(cors({
-  origin: '*', // Allow any origin to connect, or list specific URL when deployed
+  origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 app.use(express.json());
 
-// Files for local persistence
+// Files for local persistence (fallback)
 const VAPID_FILE = path.join(__dirname, 'vapid.json');
 const SUBS_FILE = path.join(__dirname, 'subscriptions.json');
 
-// 1. Setup VAPID Keys
+// --- 1. Supabase PostgreSQL Connection Pool ---
+let dbPool = null;
+if (process.env.DATABASE_URL) {
+  try {
+    dbPool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: {
+        rejectUnauthorized: false // Required for hosted databases like Supabase/Render
+      }
+    });
+    console.log('🔌 Conectado a la base de datos PostgreSQL (Supabase/Render).');
+    
+    // Auto-create subscriptions table if it doesn't exist
+    dbPool.query(`
+      CREATE TABLE IF NOT EXISTS subscriptions (
+        id SERIAL PRIMARY KEY,
+        endpoint TEXT UNIQUE NOT NULL,
+        keys JSONB NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `).catch(err => {
+      console.error('❌ Error al intentar auto-crear la tabla subscriptions en base de datos:', err);
+    });
+  } catch (err) {
+    console.error('❌ Fallo al inicializar la base de datos PostgreSQL:', err);
+    dbPool = null;
+  }
+}
+
+if (!dbPool) {
+  console.log('📂 Usando base de datos local basada en archivo JSON (subscriptions.json).');
+}
+
+// --- 2. Setup VAPID Keys ---
 let vapidKeys;
 if (fs.existsSync(VAPID_FILE)) {
   try {
     vapidKeys = JSON.parse(fs.readFileSync(VAPID_FILE, 'utf8'));
-    console.log('🔑 Loaded existing VAPID keys from vapid.json');
+    console.log('🔑 Llaves VAPID existentes cargadas desde vapid.json');
   } catch (err) {
-    console.error('Error loading vapid.json, regenerating keys.', err);
+    console.error('Error al leer vapid.json, regenerando claves.', err);
   }
 }
 
 if (!vapidKeys) {
   vapidKeys = webpush.generateVAPIDKeys();
   fs.writeFileSync(VAPID_FILE, JSON.stringify(vapidKeys, null, 2));
-  console.log('✅ Generated new VAPID keys in vapid.json');
+  console.log('✅ Nuevas llaves VAPID generadas en vapid.json');
 }
 
 webpush.setVapidDetails(
@@ -48,106 +84,156 @@ webpush.setVapidDetails(
   vapidKeys.privateKey
 );
 
-// 2. Subscription Storage Helpers
-function getSubscriptions() {
-  if (!fs.existsSync(SUBS_FILE)) return [];
-  try {
-    return JSON.parse(fs.readFileSync(SUBS_FILE, 'utf8'));
-  } catch (err) {
-    console.error('Error reading subscriptions file, returning empty array', err);
-    return [];
+// --- 3. Subscription Storage Helpers ---
+async function getSubscriptions() {
+  if (dbPool) {
+    try {
+      const res = await dbPool.query('SELECT endpoint, keys FROM subscriptions');
+      return res.rows.map(row => ({
+        endpoint: row.endpoint,
+        keys: row.keys
+      }));
+    } catch (err) {
+      console.error('Error al leer suscripciones de PostgreSQL:', err);
+      return [];
+    }
+  } else {
+    if (!fs.existsSync(SUBS_FILE)) return [];
+    try {
+      return JSON.parse(fs.readFileSync(SUBS_FILE, 'utf8'));
+    } catch (err) {
+      return [];
+    }
   }
 }
 
-function saveSubscriptions(subs) {
-  try {
-    fs.writeFileSync(SUBS_FILE, JSON.stringify(subs, null, 2));
-  } catch (err) {
-    console.error('Error saving subscriptions', err);
+async function addSubscription(sub) {
+  if (dbPool) {
+    try {
+      await dbPool.query(
+        'INSERT INTO subscriptions (endpoint, keys) VALUES ($1, $2) ON CONFLICT (endpoint) DO UPDATE SET keys = EXCLUDED.keys',
+        [sub.endpoint, JSON.stringify(sub.keys)]
+      );
+      console.log('[DB] Suscripción insertada/actualizada en Postgres.');
+    } catch (err) {
+      console.error('Error al insertar suscripción en PostgreSQL:', err);
+    }
+  } else {
+    let subs = [];
+    if (fs.existsSync(SUBS_FILE)) {
+      try {
+        subs = JSON.parse(fs.readFileSync(SUBS_FILE, 'utf8'));
+      } catch (e) {}
+    }
+    const exists = subs.find(s => s.endpoint === sub.endpoint);
+    if (!exists) {
+      subs.push(sub);
+      fs.writeFileSync(SUBS_FILE, JSON.stringify(subs, null, 2));
+      console.log('[JSON] Nueva suscripción guardada localmente.');
+    }
   }
 }
 
-// 3. Broadcast Push Notifications helper
-function sendPushNotification(payload) {
-  const subscriptions = getSubscriptions();
+async function removeSubscription(endpoint) {
+  if (dbPool) {
+    try {
+      await dbPool.query('DELETE FROM subscriptions WHERE endpoint = $1', [endpoint]);
+      console.log('[DB] Suscripción removida de Postgres.');
+    } catch (err) {
+      console.error('Error al eliminar suscripción de PostgreSQL:', err);
+    }
+  } else {
+    if (!fs.existsSync(SUBS_FILE)) return;
+    try {
+      let subs = JSON.parse(fs.readFileSync(SUBS_FILE, 'utf8'));
+      subs = subs.filter(s => s.endpoint !== endpoint);
+      fs.writeFileSync(SUBS_FILE, JSON.stringify(subs, null, 2));
+      console.log('[JSON] Suscripción removida localmente.');
+    } catch (e) {}
+  }
+}
+
+// --- 4. Broadcast Push Notifications helper ---
+async function sendPushNotification(payload) {
+  const subscriptions = await getSubscriptions();
   console.log(`[Push] Enviando notificación a ${subscriptions.length} suscriptores.`);
   
   const pushPromises = subscriptions.map((sub, index) => {
     return webpush.sendNotification(sub, JSON.stringify(payload))
-      .catch(err => {
-        // If subscription expired (410) or not found (404), flag it for removal
+      .catch(async err => {
+        // Remove expired subscriptions (410 Gone / 404 Not Found)
         if (err.statusCode === 410 || err.statusCode === 404) {
           console.log(`[Push] Suscripción #${index} expirada/inválida. Removiendo.`);
-          return { expired: true, endpoint: sub.endpoint };
+          await removeSubscription(sub.endpoint);
+        } else {
+          console.error(`[Push] Error enviando a suscripción #${index}:`, err.message);
         }
-        console.error(`[Push] Error enviando a suscripción #${index}:`, err.message);
         return null;
       });
   });
 
-  return Promise.all(pushPromises).then(results => {
-    const expiredEndpoints = results
-      .filter(res => res && res.expired)
-      .map(res => res.endpoint);
-
-    if (expiredEndpoints.length > 0) {
-      let current = getSubscriptions();
-      current = current.filter(sub => !expiredEndpoints.includes(sub.endpoint));
-      saveSubscriptions(current);
-      console.log(`[Push] Limpieza completa. Se borraron ${expiredEndpoints.length} suscripciones expiradas.`);
-    }
-  });
+  await Promise.all(pushPromises);
 }
 
-// 4. API Endpoints
+// --- 5. API Endpoints ---
 app.get('/', (req, res) => {
-  res.send('Mood Tracker API Server is Running.');
+  res.send('API de Diario de Emociones está activa.');
 });
 
-// Serve public key for frontend to register subscription
+// Endpoint to check if client lock is required
+app.get('/api/pin-required', (req, res) => {
+  const hasPin = !!process.env.APP_PIN;
+  res.json({ required: hasPin });
+});
+
+// Endpoint to verify security PIN
+app.post('/api/verify-pin', (req, res) => {
+  const userPin = req.body.pin;
+  const correctPin = process.env.APP_PIN;
+
+  if (!correctPin) {
+    // If no PIN is configured on the server, auto-unlock
+    return res.json({ success: true });
+  }
+
+  if (userPin === correctPin) {
+    res.json({ success: true });
+  } else {
+    res.status(401).json({ success: false, error: 'PIN incorrecto.' });
+  }
+});
+
+// Serve VAPID public key
 app.get('/api/vapid-public-key', (req, res) => {
   res.json({ publicKey: vapidKeys.publicKey });
 });
 
 // Subscribe to push notifications
-app.post('/api/subscribe', (req, res) => {
+app.post('/api/subscribe', async (req, res) => {
   const subscription = req.body;
   
   if (!subscription || !subscription.endpoint) {
     return res.status(400).json({ error: 'Suscripción inválida.' });
   }
 
-  let subs = getSubscriptions();
-  const exists = subs.find(s => s.endpoint === subscription.endpoint);
-  
-  if (!exists) {
-    subs.push(subscription);
-    saveSubscriptions(subs);
-    console.log(`[API] Nueva suscripción registrada. Total: ${subs.length}`);
-  }
-
+  await addSubscription(subscription);
   res.status(201).json({ message: 'Suscrito con éxito.' });
 });
 
 // Unsubscribe from push notifications
-app.post('/api/unsubscribe', (req, res) => {
+app.post('/api/unsubscribe', async (req, res) => {
   const { endpoint } = req.body;
   
   if (!endpoint) {
     return res.status(400).json({ error: 'Falta endpoint.' });
   }
 
-  let subs = getSubscriptions();
-  const initialLength = subs.length;
-  subs = subs.filter(s => s.endpoint !== endpoint);
-  saveSubscriptions(subs);
-  
-  console.log(`[API] Suscripción removida. Total: ${subs.length}`);
+  await removeSubscription(endpoint);
   res.status(200).json({ message: 'Desuscrito con éxito.' });
 });
 
-// Immediate push trigger endpoint for testing
-app.post('/api/trigger-push', (req, res) => {
+// Trigger push test
+app.post('/api/trigger-push', async (req, res) => {
   const { title, body } = req.body;
   
   const payload = {
@@ -155,23 +241,23 @@ app.post('/api/trigger-push', (req, res) => {
     body: body || 'Es hora de registrar tu humor. ¡Toca un emoji!'
   };
 
-  sendPushNotification(payload)
-    .then(() => res.json({ success: true, message: 'Notificación push enviada.' }))
-    .catch(err => {
-      console.error('[API] Error al disparar push:', err);
-      res.status(500).json({ success: false, error: err.message });
-    });
+  try {
+    await sendPushNotification(payload);
+    res.json({ success: true, message: 'Notificación push enviada.' });
+  } catch (err) {
+    console.error('[API] Error al disparar push:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
-// 5. Cron Job Scheduling (Twice a day: 10:00 AM and 8:00 PM)
-// Pattern: '0 10,20 * * *' (Minute 0, Hours 10 and 20, every day)
-cron.schedule('0 10,20 * * *', () => {
+// --- 6. Cron Job Scheduling (10:00 y 20:00) ---
+cron.schedule('0 10,20 * * *', async () => {
   console.log('⏰ [Cron] Disparando notificación diaria programada (10:00 / 20:00)');
   const payload = {
     title: '¿Cómo te sentís ahora?',
     body: 'Es hora de tu registro diario. ¿Nos contás cómo va tu día?'
   };
-  sendPushNotification(payload);
+  await sendPushNotification(payload);
 });
 
 // Start Server
